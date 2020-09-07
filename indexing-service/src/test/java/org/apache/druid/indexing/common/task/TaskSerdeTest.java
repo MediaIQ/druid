@@ -24,7 +24,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.jsontype.NamedType;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import org.apache.druid.client.indexing.ClientKillUnusedSegmentsTaskQuery;
 import org.apache.druid.data.input.impl.DimensionsSpec;
 import org.apache.druid.data.input.impl.LocalInputSource;
 import org.apache.druid.data.input.impl.NoopInputFormat;
@@ -186,6 +185,48 @@ public class TaskSerdeTest
   }
 
   @Test
+  public void testTaskResourceValid() throws Exception
+  {
+    TaskResource actual = jsonMapper.readValue(
+        "{\"availabilityGroup\":\"index_xxx_mmm\", \"requiredCapacity\":1}",
+        TaskResource.class
+    );
+    Assert.assertNotNull(actual);
+    Assert.assertNotNull(actual.getAvailabilityGroup());
+    Assert.assertTrue(actual.getRequiredCapacity() > 0);
+  }
+
+  @Test
+  public void testTaskResourceWithNullAvailabilityGroupShouldFail() throws Exception
+  {
+    thrown.expectCause(CoreMatchers.isA(NullPointerException.class));
+    jsonMapper.readValue(
+        "{\"availabilityGroup\":null, \"requiredCapacity\":10}",
+        TaskResource.class
+    );
+  }
+
+  @Test
+  public void testTaskResourceWithZeroRequiredCapacityShouldFail() throws Exception
+  {
+    thrown.expectCause(CoreMatchers.isA(NullPointerException.class));
+    jsonMapper.readValue(
+        "{\"availabilityGroup\":null, \"requiredCapacity\":0}",
+        TaskResource.class
+    );
+  }
+
+  @Test
+  public void testTaskResourceWithNegativeRequiredCapacityShouldFail() throws Exception
+  {
+    thrown.expectCause(CoreMatchers.isA(NullPointerException.class));
+    jsonMapper.readValue(
+        "{\"availabilityGroup\":null, \"requiredCapacity\":-1}",
+        TaskResource.class
+    );
+  }
+
+  @Test
   public void testIndexTaskSerde() throws Exception
   {
     final IndexTask task = new IndexTask(
@@ -228,10 +269,6 @@ public class TaskSerdeTest
                 null
             )
         ),
-        null,
-        AuthTestUtils.TEST_AUTHORIZER_MAPPER,
-        null,
-        rowIngestionMetersFactory,
         null
     );
 
@@ -312,10 +349,6 @@ public class TaskSerdeTest
                 null
             )
         ),
-        null,
-        AuthTestUtils.TEST_AUTHORIZER_MAPPER,
-        null,
-        rowIngestionMetersFactory,
         null
     );
 
@@ -339,42 +372,6 @@ public class TaskSerdeTest
     Assert.assertEquals(task.getDataSource(), task2.getDataSource());
     Assert.assertTrue(task.getIngestionSchema().getIOConfig().getInputSource() instanceof LocalInputSource);
     Assert.assertTrue(task2.getIngestionSchema().getIOConfig().getInputSource() instanceof LocalInputSource);
-  }
-
-  @Test
-  public void testKillTaskSerde() throws Exception
-  {
-    final KillUnusedSegmentsTask task = new KillUnusedSegmentsTask(
-        null,
-        "foo",
-        Intervals.of("2010-01-01/P1D"),
-        null
-    );
-
-    final String json = jsonMapper.writeValueAsString(task);
-
-    Thread.sleep(100); // Just want to run the clock a bit to make sure the task id doesn't change
-    final KillUnusedSegmentsTask task2 = (KillUnusedSegmentsTask) jsonMapper.readValue(json, Task.class);
-
-    Assert.assertEquals("foo", task.getDataSource());
-    Assert.assertEquals(Intervals.of("2010-01-01/P1D"), task.getInterval());
-
-    Assert.assertEquals(task.getId(), task2.getId());
-    Assert.assertEquals(task.getGroupId(), task2.getGroupId());
-    Assert.assertEquals(task.getDataSource(), task2.getDataSource());
-    Assert.assertEquals(task.getInterval(), task2.getInterval());
-
-    final KillUnusedSegmentsTask task3 = (KillUnusedSegmentsTask) jsonMapper.readValue(
-        jsonMapper.writeValueAsString(
-            new ClientKillUnusedSegmentsTaskQuery(
-                "foo",
-                Intervals.of("2010-01-01/P1D")
-            )
-        ), Task.class
-    );
-
-    Assert.assertEquals("foo", task3.getDataSource());
-    Assert.assertEquals(Intervals.of("2010-01-01/P1D"), task3.getInterval());
   }
 
   @Test

@@ -29,7 +29,6 @@ import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import it.unimi.dsi.fastutil.objects.Object2IntMaps;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2LongMap;
-import it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.utils.ZKPaths;
 import org.apache.druid.client.DataSourcesSnapshot;
@@ -257,13 +256,27 @@ public class DruidCoordinator
    */
   public Map<String, Object2LongMap<String>> computeUnderReplicationCountsPerDataSourcePerTier()
   {
+    final Iterable<DataSegment> dataSegments = segmentsMetadataManager.iterateAllUsedSegments();
+    return computeUnderReplicationCountsPerDataSourcePerTierForSegments(dataSegments);
+  }
+
+  /**
+   * segmentReplicantLookup use in this method could potentially be stale since it is only updated on coordinator runs.
+   * However, this is ok as long as the {@param dataSegments} is refreshed/latest as this would at least still ensure
+   * that the stale data in segmentReplicantLookup would be under counting replication levels,
+   * rather than potentially falsely reporting that everything is available.
+   *
+   * @return tier -> { dataSource -> underReplicationCount } map
+   */
+  public Map<String, Object2LongMap<String>> computeUnderReplicationCountsPerDataSourcePerTierForSegments(
+      Iterable<DataSegment> dataSegments
+  )
+  {
     final Map<String, Object2LongMap<String>> underReplicationCountsPerDataSourcePerTier = new HashMap<>();
 
     if (segmentReplicantLookup == null) {
       return underReplicationCountsPerDataSourcePerTier;
     }
-
-    final Iterable<DataSegment> dataSegments = segmentsMetadataManager.iterateAllUsedSegments();
 
     final DateTime now = DateTimes.nowUtc();
 
@@ -271,20 +284,21 @@ public class DruidCoordinator
       final List<Rule> rules = metadataRuleManager.getRulesWithDefault(segment.getDataSource());
 
       for (final Rule rule : rules) {
-        if (!(rule instanceof LoadRule && rule.appliesTo(segment, now))) {
+        if (!rule.appliesTo(segment, now)) {
+          // Rule did not match. Continue to the next Rule.
           continue;
         }
+        if (!rule.canLoadSegments()) {
+          // Rule matched but rule does not and cannot load segments.
+          // Hence, there is no need to update underReplicationCountsPerDataSourcePerTier map
+          break;
+        }
 
-        ((LoadRule) rule)
-            .getTieredReplicants()
-            .forEach((final String tier, final Integer ruleReplicants) -> {
-              int currentReplicants = segmentReplicantLookup.getLoadedReplicants(segment.getId(), tier);
-              Object2LongMap<String> underReplicationPerDataSource = underReplicationCountsPerDataSourcePerTier
-                  .computeIfAbsent(tier, ignored -> new Object2LongOpenHashMap<>());
-              ((Object2LongOpenHashMap<String>) underReplicationPerDataSource)
-                  .addTo(segment.getDataSource(), Math.max(ruleReplicants - currentReplicants, 0));
-            });
-        break; // only the first matching rule applies
+        rule.updateUnderReplicated(underReplicationCountsPerDataSourcePerTier, segmentReplicantLookup, segment);
+
+        // Only the first matching rule applies. This is because the Coordinator cycle through all used segments
+        // and match each segment with the first rule that applies. Each segment may only match a single rule.
+        break;
       }
     }
 
@@ -320,7 +334,7 @@ public class DruidCoordinator
 
     for (ImmutableDruidDataSource dataSource : dataSources) {
       final Set<DataSegment> segments = Sets.newHashSet(dataSource.getSegments());
-      final int numUsedSegments = segments.size();
+      final int numPublishedSegments = segments.size();
 
       // remove loaded segments
       for (DruidServer druidServer : serverInventoryView.getInventory()) {
@@ -333,10 +347,10 @@ public class DruidCoordinator
           }
         }
       }
-      final int numUnloadedSegments = segments.size();
+      final int numUnavailableSegments = segments.size();
       loadStatus.put(
           dataSource.getName(),
-          100 * ((double) (numUsedSegments - numUnloadedSegments) / (double) numUsedSegments)
+          100 * ((double) (numPublishedSegments - numUnavailableSegments) / (double) numPublishedSegments)
       );
     }
 
@@ -513,6 +527,13 @@ public class DruidCoordinator
     }
   }
 
+  public void runCompactSegmentsDuty()
+  {
+    final int startingLeaderCounter = coordLeaderSelector.localTerm();
+    DutiesRunnable compactSegmentsDuty = new DutiesRunnable(makeCompactSegmentsDuty(), startingLeaderCounter);
+    compactSegmentsDuty.run();
+  }
+
   private void becomeLeader()
   {
     synchronized (lock) {
@@ -611,7 +632,7 @@ public class DruidCoordinator
   {
     List<CoordinatorDuty> duties = new ArrayList<>();
     duties.add(new LogUsedSegments());
-    duties.add(compactSegments);
+    duties.addAll(makeCompactSegmentsDuty());
     duties.addAll(indexingServiceDuties);
 
     log.debug(
@@ -621,13 +642,18 @@ public class DruidCoordinator
     return ImmutableList.copyOf(duties);
   }
 
-  public class DutiesRunnable implements Runnable
+  private List<CoordinatorDuty> makeCompactSegmentsDuty()
+  {
+    return ImmutableList.of(compactSegments);
+  }
+
+  private class DutiesRunnable implements Runnable
   {
     private final long startTimeNanos = System.nanoTime();
     private final List<CoordinatorDuty> duties;
     private final int startingLeaderCounter;
 
-    protected DutiesRunnable(List<CoordinatorDuty> duties, final int startingLeaderCounter)
+    private DutiesRunnable(List<CoordinatorDuty> duties, final int startingLeaderCounter)
     {
       this.duties = duties;
       this.startingLeaderCounter = startingLeaderCounter;
@@ -740,7 +766,6 @@ public class DruidCoordinator
                    .withDruidCluster(cluster)
                    .withLoadManagementPeons(loadManagementPeons)
                    .withSegmentReplicantLookup(segmentReplicantLookup)
-                   .withBalancerReferenceTimestamp(DateTimes.nowUtc())
                    .build();
     }
 
@@ -749,7 +774,7 @@ public class DruidCoordinator
       List<ImmutableDruidServer> currentServers = serverInventoryView
           .getInventory()
           .stream()
-          .filter(DruidServer::segmentReplicatable)
+          .filter(DruidServer::isSegmentReplicationOrBroadcastTarget)
           .map(DruidServer::toImmutableDruidServer)
           .collect(Collectors.toList());
 

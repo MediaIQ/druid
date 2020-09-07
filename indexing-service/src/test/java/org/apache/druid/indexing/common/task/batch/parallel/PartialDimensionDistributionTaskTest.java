@@ -22,6 +22,7 @@ package org.apache.druid.indexing.common.task.batch.parallel;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Joiner;
 import com.google.common.collect.Iterables;
+import org.apache.druid.client.indexing.NoopIndexingServiceClient;
 import org.apache.druid.data.input.InputFormat;
 import org.apache.druid.data.input.InputSource;
 import org.apache.druid.data.input.impl.InlineInputSource;
@@ -31,6 +32,7 @@ import org.apache.druid.indexer.partitions.DynamicPartitionsSpec;
 import org.apache.druid.indexer.partitions.HashedPartitionsSpec;
 import org.apache.druid.indexer.partitions.PartitionsSpec;
 import org.apache.druid.indexer.partitions.SingleDimensionPartitionsSpec;
+import org.apache.druid.indexing.common.TaskInfoProvider;
 import org.apache.druid.indexing.common.TaskToolbox;
 import org.apache.druid.indexing.common.task.IndexTaskClientFactory;
 import org.apache.druid.indexing.common.task.batch.parallel.distribution.StringDistribution;
@@ -44,6 +46,7 @@ import org.apache.logging.log4j.core.LogEvent;
 import org.easymock.Capture;
 import org.easymock.EasyMock;
 import org.hamcrest.Matchers;
+import org.joda.time.Duration;
 import org.joda.time.Interval;
 import org.junit.Assert;
 import org.junit.Before;
@@ -148,13 +151,35 @@ public class PartialDimensionDistributionTaskTest
     @Rule
     public LoggerCaptureRule logger = new LoggerCaptureRule(PartialDimensionDistributionTask.class);
 
+    private Capture<SubTaskReport> reportCapture;
     private TaskToolbox taskToolbox;
 
     @Before
     public void setup()
     {
+      reportCapture = Capture.newInstance();
+      ParallelIndexSupervisorTaskClient taskClient = EasyMock.mock(ParallelIndexSupervisorTaskClient.class);
+      taskClient.report(EasyMock.eq(ParallelIndexTestingFactory.SUPERVISOR_TASK_ID), EasyMock.capture(reportCapture));
+      EasyMock.replay(taskClient);
       taskToolbox = EasyMock.mock(TaskToolbox.class);
       EasyMock.expect(taskToolbox.getIndexingTmpDir()).andStubReturn(temporaryFolder.getRoot());
+      EasyMock.expect(taskToolbox.getSupervisorTaskClientFactory()).andReturn(
+          new IndexTaskClientFactory<ParallelIndexSupervisorTaskClient>()
+          {
+            @Override
+            public ParallelIndexSupervisorTaskClient build(
+                TaskInfoProvider taskInfoProvider,
+                String callerId,
+                int numThreads,
+                Duration httpTimeout,
+                long numRetries
+            )
+            {
+              return taskClient;
+            }
+          }
+      );
+      EasyMock.expect(taskToolbox.getIndexingServiceClient()).andReturn(new NoopIndexingServiceClient());
       EasyMock.replay(taskToolbox);
     }
 
@@ -190,7 +215,6 @@ public class PartialDimensionDistributionTaskTest
       PartialDimensionDistributionTask task = new PartialDimensionDistributionTaskBuilder()
           .inputSource(inlineInputSource)
           .tuningConfig(tuningConfig)
-          .taskClientFactory(ParallelIndexTestingFactory.createTaskClientFactory())
           .build();
 
       task.runTask(taskToolbox);
@@ -210,7 +234,6 @@ public class PartialDimensionDistributionTaskTest
           .build();
       PartialDimensionDistributionTask task = new PartialDimensionDistributionTaskBuilder()
           .tuningConfig(tuningConfig)
-          .taskClientFactory(ParallelIndexTestingFactory.createTaskClientFactory())
           .build();
 
       task.runTask(taskToolbox);
@@ -227,7 +250,6 @@ public class PartialDimensionDistributionTaskTest
           .build();
       PartialDimensionDistributionTask task = new PartialDimensionDistributionTaskBuilder()
           .tuningConfig(tuningConfig)
-          .taskClientFactory(ParallelIndexTestingFactory.createTaskClientFactory())
           .build();
 
       exception.expect(RuntimeException.class);
@@ -345,7 +367,7 @@ public class PartialDimensionDistributionTaskTest
           .dataSchema(dataSchema)
           .inputSource(inlineInputSource)
           .dedupRowDimValueFilterSupplier(
-              () -> new PartialDimensionDistributionTask.DedupRowDimensionValueFilter(
+              () -> new PartialDimensionDistributionTask.DedupInputRowFilter(
                   dataSchema.getGranularitySpec().getQueryGranularity(),
                   smallBloomFilter,
                   manyFalsePositiveBloomFilter
@@ -372,7 +394,6 @@ public class PartialDimensionDistributionTaskTest
     public void returnsSuccessIfNoExceptions() throws Exception
     {
       PartialDimensionDistributionTask task = new PartialDimensionDistributionTaskBuilder()
-          .taskClientFactory(ParallelIndexTestingFactory.createTaskClientFactory())
           .build();
 
       TaskStatus taskStatus = task.runTask(taskToolbox);
@@ -383,14 +404,10 @@ public class PartialDimensionDistributionTaskTest
 
     private DimensionDistributionReport runTask(PartialDimensionDistributionTaskBuilder taskBuilder)
     {
-      Capture<SubTaskReport> reportCapture = Capture.newInstance();
-      ParallelIndexSupervisorTaskClient taskClient = EasyMock.mock(ParallelIndexSupervisorTaskClient.class);
-      taskClient.report(EasyMock.eq(ParallelIndexTestingFactory.SUPERVISOR_TASK_ID), EasyMock.capture(reportCapture));
-      EasyMock.replay(taskClient);
+
 
       try {
-        taskBuilder.taskClientFactory((taskInfoProvider, callerId, numThreads, httpTimeout, numRetries) -> taskClient)
-                   .build()
+        taskBuilder.build()
                    .runTask(taskToolbox);
       }
       catch (Exception e) {
@@ -412,10 +429,7 @@ public class PartialDimensionDistributionTaskTest
         .build();
     private DataSchema dataSchema =
         ParallelIndexTestingFactory.createDataSchema(ParallelIndexTestingFactory.INPUT_INTERVALS);
-    private IndexTaskClientFactory<ParallelIndexSupervisorTaskClient> taskClientFactory =
-        ParallelIndexTestingFactory.TASK_CLIENT_FACTORY;
-    private Supplier<PartialDimensionDistributionTask.DedupRowDimensionValueFilter> dedupRowDimValueFilterSupplier =
-        null;
+    private Supplier<PartialDimensionDistributionTask.DedupInputRowFilter> dedupRowDimValueFilterSupplier = null;
 
     @SuppressWarnings("SameParameterValue")
     PartialDimensionDistributionTaskBuilder id(String id)
@@ -442,16 +456,8 @@ public class PartialDimensionDistributionTaskTest
       return this;
     }
 
-    PartialDimensionDistributionTaskBuilder taskClientFactory(
-        IndexTaskClientFactory<ParallelIndexSupervisorTaskClient> taskClientFactory
-    )
-    {
-      this.taskClientFactory = taskClientFactory;
-      return this;
-    }
-
     PartialDimensionDistributionTaskBuilder dedupRowDimValueFilterSupplier(
-        Supplier<PartialDimensionDistributionTask.DedupRowDimensionValueFilter> dedupRowDimValueFilterSupplier
+        Supplier<PartialDimensionDistributionTask.DedupInputRowFilter> dedupRowDimValueFilterSupplier
     )
     {
       this.dedupRowDimValueFilterSupplier = dedupRowDimValueFilterSupplier;
@@ -463,9 +469,9 @@ public class PartialDimensionDistributionTaskTest
       ParallelIndexIngestionSpec ingestionSpec =
           ParallelIndexTestingFactory.createIngestionSpec(inputSource, INPUT_FORMAT, tuningConfig, dataSchema);
 
-      Supplier<PartialDimensionDistributionTask.DedupRowDimensionValueFilter> supplier =
+      Supplier<PartialDimensionDistributionTask.DedupInputRowFilter> supplier =
           dedupRowDimValueFilterSupplier == null
-          ? () -> new PartialDimensionDistributionTask.DedupRowDimensionValueFilter(
+          ? () -> new PartialDimensionDistributionTask.DedupInputRowFilter(
               dataSchema.getGranularitySpec().getQueryGranularity()
           )
           : dedupRowDimValueFilterSupplier;
@@ -478,8 +484,6 @@ public class PartialDimensionDistributionTaskTest
           ParallelIndexTestingFactory.NUM_ATTEMPTS,
           ingestionSpec,
           ParallelIndexTestingFactory.CONTEXT,
-          ParallelIndexTestingFactory.INDEXING_SERVICE_CLIENT,
-          taskClientFactory,
           supplier
       );
     }
